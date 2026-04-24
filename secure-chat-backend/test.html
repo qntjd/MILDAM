@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Secure Chat Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        .section { border: 1px solid #ccc; padding: 15px; margin-bottom: 15px; border-radius: 8px; }
+        h3 { margin-top: 0; }
+        input { padding: 6px; margin: 4px; width: 300px; }
+        button { padding: 6px 12px; margin: 4px; cursor: pointer; }
+        #output { border: 1px solid #ccc; padding: 10px; height: 300px; overflow-y: auto; background: #f9f9f9; }
+        .msg-normal  { color: #333; }
+        .msg-secret  { color: #6600cc; }
+        .msg-system  { color: #999; font-style: italic; }
+        .msg-error   { color: red; }
+    </style>
+</head>
+<body>
+
+<h2>Secure Chat Test</h2>
+
+<!-- 연결 설정 -->
+<div class="section">
+    <h3>1. 연결</h3>
+    <input id="token"  placeholder="Access Token" style="width:400px"/>
+    <input id="roomId" placeholder="Room ID"/>
+    <button onclick="connect()">연결</button>
+    <button onclick="disconnect()">연결 해제</button>
+</div>
+
+<!-- 일반 채팅 -->
+<div class="section">
+    <h3>2. 일반 채팅</h3>
+    <input id="message" placeholder="메시지 입력"/>
+    <button onclick="sendMessage()">전송</button>
+</div>
+
+<!-- 시크릿 채팅 -->
+<div class="section">
+    <h3>3. 시크릿 채팅 (E2E 암호화)</h3>
+    <input id="recipientId" placeholder="상대방 username"/>
+    <button onclick="initSecretChat()">시크릿 채팅 시작</button>
+    <br>
+    <input id="sessionId" placeholder="Session ID (자동 입력됨)"/>
+    <br>
+    <input id="secretMessage" placeholder="시크릿 메시지 입력"/>
+    <input id="ttl" placeholder="TTL (초, 선택사항)" style="width:150px"/>
+    <button onclick="sendSecretMessage()">암호화 전송</button>
+    <br>
+    <span id="fingerprint" style="font-size:20px"></span>
+</div>
+
+<!-- 로그 -->
+<div class="section">
+    <h3>로그</h3>
+    <button onclick="clearLog()">지우기</button>
+    <div id="output"></div>
+</div>
+
+<script>
+    var stompClient = null;
+    var myKeyPair   = null;   // { publicKey, privateKey }
+    var sharedKey   = null;   // CryptoKey (AES-256-GCM)
+
+    // ── 연결 ─────────────────────────────────────────────────────
+
+    function connect() {
+        var token  = document.getElementById('token').value.trim();
+        var roomId = document.getElementById('roomId').value.trim();
+
+        var socket = new SockJS('http://localhost:8080/ws/chat');
+        stompClient = Stomp.over(socket);
+        stompClient.debug = null;
+
+        stompClient.connect(
+            { 'Authorization': 'Bearer ' + token },
+            function(frame) {
+                log('연결 성공', 'system');
+
+                // 일반 채팅 구독
+                stompClient.subscribe('/topic/chat.' + roomId, function(msg) {
+                    var body = JSON.parse(msg.body);
+                    if (body.type === 'DELETE') {
+                        log('[삭제] messageId: ' + body.messageId, 'system');
+                    } else {
+                        log('[일반] ' + body.senderUsername + ': ' + body.content, 'normal');
+                    }
+                });
+
+                // 시크릿 채팅 이벤트 구독
+                stompClient.subscribe('/user/queue/secret-request', function(msg) {
+                    var body = JSON.parse(msg.body);
+                    log('[시크릿 요청] ' + body.from + ' 으로부터 요청', 'secret');
+                    document.getElementById('sessionId').value = body.sessionId;
+                    acceptSecretChat(body.sessionId);
+                });
+
+                stompClient.subscribe('/user/queue/secret-key', function(msg) {
+                    var body = JSON.parse(msg.body);
+                    log('[공개키 수신] sessionId: ' + body.sessionId, 'secret');
+                    onReceivePublicKey(body.sessionId, body.publicKey);
+                });
+
+                stompClient.subscribe('/user/queue/secret-ready', function(msg) {
+                    var body = JSON.parse(msg.body);
+                    log('[시크릿 채팅 활성화] sessionId: ' + body.sessionId, 'secret');
+                });
+
+                stompClient.subscribe('/user/queue/secret-message', function(msg) {
+                    var body = JSON.parse(msg.body);
+                    decryptAndShow(body.cipherText, body.messageId);
+                });
+
+                stompClient.subscribe('/user/queue/secret-terminated', function(msg) {
+                    var body = JSON.parse(msg.body);
+                    log('[세션 종료] reason: ' + body.reason, 'system');
+                    sharedKey = null;
+                    myKeyPair = null;
+                });
+            },
+            function(error) {
+                log('연결 실패: ' + error, 'error');
+            }
+        );
+    }
+
+    function disconnect() {
+        if (stompClient) {
+            stompClient.disconnect();
+            log('연결 해제', 'system');
+        }
+    }
+
+    // ── 일반 채팅 ─────────────────────────────────────────────────
+
+    function sendMessage() {
+        var roomId  = document.getElementById('roomId').value.trim();
+        var content = document.getElementById('message').value.trim();
+        if (!content) return;
+
+        stompClient.send('/app/chat.send', {}, JSON.stringify({
+            roomId:  roomId,
+            content: content
+        }));
+        document.getElementById('message').value = '';
+    }
+
+    // ── 시크릿 채팅 ───────────────────────────────────────────────
+
+    async function initSecretChat() {
+        var token       = document.getElementById('token').value.trim();
+        var recipientId = document.getElementById('recipientId').value.trim();
+
+        // 1. 서버에 세션 생성 요청
+        var res = await fetch('http://localhost:8080/api/secret/init', {
+            method:  'POST',
+            headers: {
+                'Content-Type':  'application/json',
+                'Authorization': 'Bearer ' + token
+            },
+            body: JSON.stringify({ recipientId: recipientId })
+        });
+        var data = await res.json();
+        var sessionId = data.sessionId;
+        document.getElementById('sessionId').value = sessionId;
+        log('[세션 생성] sessionId: ' + sessionId, 'secret');
+
+        // 2. X25519 키 쌍 생성
+        myKeyPair = await window.crypto.subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' },
+            true,
+            ['deriveKey', 'deriveBits']
+        );
+
+        // 3. 공개키만 서버로 전송 (비밀키는 절대 전송 안 함)
+        var pubKeyRaw = await window.crypto.subtle.exportKey('raw', myKeyPair.publicKey);
+        var pubKeyB64 = btoa(String.fromCharCode(...new Uint8Array(pubKeyRaw)));
+
+        stompClient.send('/app/secret.key', {}, JSON.stringify({
+            sessionId: sessionId,
+            publicKey: pubKeyB64
+        }));
+        log('[공개키 전송] sessionId: ' + sessionId, 'secret');
+    }
+
+    async function acceptSecretChat(sessionId) {
+        // 수신측도 키 쌍 생성 후 공개키 전송
+        myKeyPair = await window.crypto.subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' },
+            true,
+            ['deriveKey', 'deriveBits']
+        );
+
+        var pubKeyRaw = await window.crypto.subtle.exportKey('raw', myKeyPair.publicKey);
+        var pubKeyB64 = btoa(String.fromCharCode(...new Uint8Array(pubKeyRaw)));
+
+        stompClient.send('/app/secret.key', {}, JSON.stringify({
+            sessionId: sessionId,
+            publicKey: pubKeyB64
+        }));
+        log('[공개키 응답] sessionId: ' + sessionId, 'secret');
+    }
+
+    async function onReceivePublicKey(sessionId, theirPubKeyB64) {
+        // 상대방 공개키로 공유 비밀키 도출
+        var theirPubRaw = Uint8Array.from(atob(theirPubKeyB64), c => c.charCodeAt(0));
+        var theirPubKey = await window.crypto.subtle.importKey(
+            'raw', theirPubRaw,
+            { name: 'ECDH', namedCurve: 'P-256' },
+            true, []
+        );
+
+        var sharedBits = await window.crypto.subtle.deriveBits(
+            { name: 'ECDH', public: theirPubKey },
+            myKeyPair.privateKey,
+            256
+        );
+
+        // AES-256-GCM 키로 변환
+        sharedKey = await window.crypto.subtle.importKey(
+            'raw', sharedBits,
+            { name: 'AES-GCM' },
+            false,
+            ['encrypt', 'decrypt']
+        );
+
+        // Fingerprint 계산
+        var hashBuffer = await window.crypto.subtle.digest('SHA-256', sharedBits);
+        var hashArray  = Array.from(new Uint8Array(hashBuffer).slice(0, 10));
+        var hexFp      = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        var emoji      = hexToEmoji(hexFp);
+
+        document.getElementById('fingerprint').textContent = '키 지문: ' + emoji;
+        log('[키 지문] ' + emoji + ' — 상대방과 비교해서 일치하면 안전해요', 'secret');
+
+        // 지문 확인 서버에 전송
+        stompClient.send('/app/secret.confirm', {}, JSON.stringify({
+            sessionId:        sessionId,
+            fingerprintEmoji: emoji
+        }));
+    }
+
+    async function sendSecretMessage() {
+        if (!sharedKey) {
+            log('먼저 시크릿 채팅 세션을 시작해주세요', 'error');
+            return;
+        }
+
+        var sessionId = document.getElementById('sessionId').value.trim();
+        var content   = document.getElementById('secretMessage').value.trim();
+        var ttl       = document.getElementById('ttl').value.trim();
+        var messageId = crypto.randomUUID();
+
+        if (!content) return;
+
+        // AES-256-GCM 암호화
+        var iv = window.crypto.getRandomValues(new Uint8Array(12));
+        var enc = new TextEncoder();
+        var ct  = await window.crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv: iv, additionalData: enc.encode(messageId) },
+            sharedKey,
+            enc.encode(content)
+        );
+
+        var combined = new Uint8Array(iv.byteLength + ct.byteLength);
+        combined.set(iv, 0);
+        combined.set(new Uint8Array(ct), iv.byteLength);
+        var cipherB64 = btoa(String.fromCharCode(...combined));
+
+        stompClient.send('/app/secret.send', {}, JSON.stringify({
+            sessionId:  sessionId,
+            cipherText: cipherB64,
+            ttlSeconds: ttl ? parseInt(ttl) : null
+        }));
+
+        log('[암호화 전송] messageId: ' + messageId, 'secret');
+        document.getElementById('secretMessage').value = '';
+    }
+
+    async function decryptAndShow(cipherB64, messageId) {
+        if (!sharedKey) {
+            log('[시크릿 수신] 키 없음 — 복호화 불가', 'error');
+            return;
+        }
+
+        try {
+            var combined = Uint8Array.from(atob(cipherB64), c => c.charCodeAt(0));
+            var iv       = combined.slice(0, 12);
+            var ct       = combined.slice(12);
+            var enc      = new TextEncoder();
+
+            var plain = await window.crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: iv, additionalData: enc.encode(messageId) },
+                sharedKey,
+                ct
+            );
+
+            log('[시크릿] ' + new TextDecoder().decode(plain), 'secret');
+        } catch(e) {
+            log('[시크릿] 복호화 실패: ' + e, 'error');
+        }
+    }
+
+    // ── 유틸 ──────────────────────────────────────────────────────
+
+    function hexToEmoji(hex) {
+        var pool = ['🌊','🌸','🍎','🌺','🦁','🐬','🦋','🌙','⭐','🔥',
+                    '🍀','🌈','🎵','💎','🌻','🦚','🍁','🎭','🧊','🌾',
+                    '🏔️','🦅','🐾','🎪','🌠','🍄','🌲','🦈','🎯','🦜'];
+        var result = '';
+        for (var i = 0; i < 10; i += 2) {
+            result += pool[parseInt(hex.slice(i, i+2), 16) % pool.length];
+        }
+        return result;
+    }
+
+    function log(msg, type) {
+        var div  = document.getElementById('output');
+        var p    = document.createElement('p');
+        p.className = 'msg-' + (type || 'normal');
+        p.style.margin = '2px 0';
+        p.textContent  = new Date().toLocaleTimeString() + ' ' + msg;
+        div.appendChild(p);
+        div.scrollTop = div.scrollHeight;
+    }
+
+    function clearLog() {
+        document.getElementById('output').innerHTML = '';
+    }
+</script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+spring:
+    application:
+        name: secure-chat
+    datasource:
+        url: jdbc:postgresql://localhost:5432/securechat
+        username: chatuser
+        password: ${DB_PASSWORD}
+        driver-class-name: org.postgresql.Driver
+
+    jpa:
+        hibernate:
+            ddl-auto: create
+        show-sql: true
+        properties:
+            hibernate:
+                dialect: org.hibernate.dialect.PostgreSQLDialect
+                format_sql: true
+    data:
+        redis:
+            host: ${REDIS_HOST:localhost}
+            port: 6379
+            password: ${REDIS_PASSWORD}
+    security:
+        oauth2:
+            resourceserver:
+                jwt:
+                    secret-key: ${JWT_SECRET}
+
+server:
+    port: 8080
+  ##  ssl:
+    #    enabled: true
+    #   key-store: classpath:securechat.p12
+    #    key-store-password: ${KEYSTORE_PASSWORD:changeme}
+    #    key-store-type: PKCS12
+    #    key-alias: securechat
+    #    protocol: TLS
+    #    enabled-protocols: TLSv1.3
+
+jwt:
+    secret: ${JWT_SECRET:thisIsAVeryLongSecretKeyForDevelopmentOnly1234567890}
+    access-token-expiry: 900        # 15분 (초)
+    refresh-token-expiry: 604800  
+
+logging:
+    level:
+        com.securechat: DEBUG
+        org.springframework.security: INFO
+
+                    
